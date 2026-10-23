@@ -1,0 +1,13 @@
+# --- 数据 / 输出 (体积大, 不提交) ---
+*.csv
+*.npy
+*.parquet
+*.txt.bak
+
+# --- Python ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# --- 日志 / 临时 ---
+*.log

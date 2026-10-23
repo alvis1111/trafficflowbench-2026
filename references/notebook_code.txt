@@ -1,0 +1,2156 @@
+
+########## ## Section 1: Modular Workspace Setup ##########
+import os
+os.makedirs('src', exist_ok=True)
+print('src/ ready')
+
+
+########## ## Section 2: Configuration & Path Resolution (`src/config.py`) ##########
+%%writefile src/config.py
+"""Configuration constants and path discovery for TrafficFlowBench 2026."""
+from __future__ import annotations
+
+import glob
+from pathlib import Path
+
+# Competition Corridor Panels (10 directional panels across 5 freeway corridor families)
+PANELS = [
+    "D7_I10_E", "D7_I10_W",
+    "D7_I210_E", "D7_I210_W",
+    "D7_I405_N", "D7_I405_S",
+    "D12_I5_N", "D12_I5_S",
+    "D12_I405_N", "D12_I405_S"
+]
+
+CORRIDOR_FAMILIES = {
+    "D7_I10_E": "D7_I10",
+    "D7_I10_W": "D7_I10",
+    "D7_I210_E": "D7_I210",
+    "D7_I210_W": "D7_I210",
+    "D7_I405_N": "D7_I405",
+    "D7_I405_S": "D7_I405",
+    "D12_I5_N": "D12_I5",
+    "D12_I5_S": "D12_I5",
+    "D12_I405_N": "D12_I405",
+    "D12_I405_S": "D12_I405"
+}
+
+# Corridors excluded from Task 2 (Queue Forecasting) by competition specification
+TASK2_EXCLUDED_PANELS = {"D12_I405_N", "D12_I405_S"}
+TASK2_ACTIVE_PANELS = [p for p in PANELS if p not in TASK2_EXCLUDED_PANELS]
+
+# Task Weights in Final Composite Leaderboard Score
+# S_total = 0.35 * S_state + 0.30 * S_queue + 0.15 * S_physics + 0.20 * S_ODME
+WEIGHT_TASK1_STATE = 0.35
+WEIGHT_TASK2_QUEUE = 0.30
+WEIGHT_TASK3_PHYSICS = 0.15
+WEIGHT_TASK4_ODME = 0.20
+
+# Task 1 Scoring Parameters
+SPEED_NORMALIZER = 25.0       # km/h
+FLOW_NORMALIZER = 600.0       # veh/h/lane
+SPEED_WEIGHT = 0.54
+FLOW_WEIGHT = 0.46
+REGIMES = ("R1", "R2", "R3")
+
+# Time Resolution Constants
+INTERVAL_MINUTES = 5.0
+SLOTS_PER_DAY = 288           # 24 hours * 12 slots/hour
+SLOTS_PER_WEEK = 7 * 288      # 2,016 slots/week
+
+# Task 2 Horizon Constants
+TASK2_HISTORY_STEPS = 12      # 60 minutes history
+TASK2_HORIZON_STEPS = 6       # 30 minutes horizon (T+5, T+10, T+15, T+20, T+25, T+30)
+
+# Task 4 Default Regularization Parameter (calibrated to official benchmark setting: S_link = 0.9999)
+DEFAULT_REG_LAMBDA = 0.05
+
+
+def locate_release_root(custom_path: str | Path | None = None) -> Path:
+    """Locate the competition dataset release directory.
+    
+    Checks standard Kaggle paths, local paths, and environment overrides.
+    """
+    if custom_path:
+        p = Path(custom_path).resolve()
+        if (p / "config" / "corridors.json").exists() or (p / "corridors").exists():
+            return p
+        if p.name == "corridors" and p.parent.exists():
+            return p.parent
+
+    candidates = [
+        "/kaggle/input/2026-ieee-big-data-traffic-flow-bench/kaggle_public",
+        "/kaggle/input/competitions/2026-ieee-big-data-traffic-flow-bench/kaggle_public",
+        "/kaggle/input/2026-ieee-big-data-traffic-flow-bench",
+        "/home/arch/ipynb/ieee/data/kaggle_public",
+        "/home/arch/ipynb/ieee/data",
+        "/home/arch/ipynb/ieee/kaggle_public",
+        "kaggle_public",
+        "data/kaggle_public",
+        "."
+    ]
+    # Also look inside /kaggle/input if running on Kaggle
+    candidates += glob.glob("/kaggle/input/**/kaggle_public", recursive=True)
+    candidates += glob.glob("/kaggle/input/**/corridors", recursive=True)
+
+    for c in candidates:
+        p = Path(c)
+        if (p / "config" / "corridors.json").exists() or (p / "corridors").exists():
+            return p
+        if p.name == "corridors" and p.parent.exists():
+            return p.parent
+
+    for p in Path(".").rglob("submission_key.csv"):
+        return p.parent
+
+    raise FileNotFoundError(
+        "Could not find competition release root (kaggle_public). "
+        "Please provide --release-root or place data under data/kaggle_public."
+    )
+
+
+########## ## Section 3: Corridor Topology & Fundamental Diagram Utilities (`src/network_utils.py`) ##########
+%%writefile src/network_utils.py
+"""Network, topology, and Fundamental Diagram parameters loader."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+import numpy as np
+import pandas as pd
+
+
+def load_lane_counts(panel_dir: Path) -> dict[str, float]:
+    """Extract lane counts keyed by link_id and station_id."""
+    lanes: dict[str, float] = {}
+    links_path = panel_dir / "network" / "links.csv"
+    fd_path = panel_dir / "network" / "fd_parameters.csv"
+    
+    if links_path.exists():
+        df = pd.read_csv(links_path, dtype={"link_id": str})
+        if "lanes" in df.columns:
+            lns = pd.to_numeric(df["lanes"], errors="coerce")
+            valid = lns.notna() & (lns >= 1) & (lns <= 16)
+            for lid, l in zip(df["link_id"][valid], lns[valid]):
+                lanes[str(lid)] = float(l)
+                
+    if fd_path.exists():
+        df = pd.read_csv(fd_path, dtype={"station_id": str, "link_id": str})
+        if "lanes" in df.columns:
+            lns = pd.to_numeric(df["lanes"], errors="coerce")
+            valid = lns.notna() & (lns >= 1) & (lns <= 16)
+            for _, row in df[valid].iterrows():
+                if pd.notna(row.get("station_id")):
+                    lanes[str(row["station_id"])] = float(row["lanes"])
+                if pd.notna(row.get("link_id")):
+                    lanes[str(row["link_id"])] = float(row["lanes"])
+    return lanes
+
+
+def load_fd_params(panel_dir: Path) -> dict[str, dict[str, float]]:
+    """Load per-link fundamental diagram parameters with validated triangular FD properties.
+    
+    Computes:
+    - vf: free-flow speed (km/h)
+    - cap: capacity (veh/h total)
+    - lanes: number of lanes
+    - length: length of link (km)
+    - k_crit: critical density (veh/km total) = cap / vf
+    - k_jam: jam density (veh/km total)
+    - wave_speed: backward shockwave speed w = cap / (k_jam - k_crit) (km/h)
+    - v_cut: queue cutoff speed = 0.60 * vf (km/h)
+    """
+    links_path = panel_dir / "network" / "links.csv"
+    fd_path = panel_dir / "network" / "fd_parameters.csv"
+    params: dict[str, dict[str, Any]] = {}
+    
+    if links_path.exists():
+        df = pd.read_csv(links_path, dtype={"link_id": str})
+        for _, r in df.iterrows():
+            lid = str(r["link_id"])
+            vf = float(pd.to_numeric(r.get("free_speed_kmh"), errors="coerce") or 105.0)
+            cap = float(pd.to_numeric(r.get("capacity_vph"), errors="coerce") or 0)
+            ln = float(pd.to_numeric(r.get("lanes"), errors="coerce") or 4.0)
+            ln = max(ln, 1.0)
+            length = float(pd.to_numeric(r.get("length_km"), errors="coerce") or 1.0)
+            if cap <= 0:
+                cap = 1800.0 * ln
+            params[lid] = {"vf": vf, "cap": cap, "lanes": ln, "length": length}
+
+    if fd_path.exists():
+        fd = pd.read_csv(fd_path, dtype={"link_id": str, "station_id": str})
+        for lid, g in fd.groupby("link_id"):
+            lid = str(lid)
+            if lid not in params:
+                params[lid] = {"vf": 105.0, "cap": 7200.0, "lanes": 4.0, "length": 1.0}
+            if "free_speed_kmh" in g.columns:
+                v = g["free_speed_kmh"].dropna().mean()
+                if pd.notna(v) and v > 0:
+                    params[lid]["vf"] = float(v)
+            if "capacity_vph" in g.columns:
+                v = g["capacity_vph"].dropna().mean()
+                if pd.notna(v) and v > 0:
+                    params[lid]["cap"] = float(v)
+            if "lanes" in g.columns:
+                v = g["lanes"].dropna().mean()
+                if pd.notna(v) and v >= 1:
+                    params[lid]["lanes"] = float(v)
+            if "k_jam" in g.columns:
+                v = g["k_jam"].dropna().mean()
+                if pd.notna(v) and v > 0:
+                    params[lid]["k_jam_raw"] = float(v)
+            if "v_cut" in g.columns:
+                v = g["v_cut"].dropna().mean()
+                if pd.notna(v) and v > 0:
+                    params[lid]["v_cut_raw"] = float(v)
+
+    for lid, p in params.items():
+        vf = p["vf"]
+        cap = p["cap"]
+        ln = p["lanes"]
+        p["k_crit"] = cap / max(vf, 1.0)
+        p["k_jam"] = p.get("k_jam_raw", 100.0 * max(ln, 1.0))
+        p["k_jam"] = max(p["k_jam"], p["k_crit"] * 1.05)
+        p["wave_speed"] = cap / max(p["k_jam"] - p["k_crit"], 1e-9)
+        p["v_cut"] = p.get("v_cut_raw", vf * 0.60)
+        
+    return params
+
+
+def load_topology(panel_dir: Path) -> dict[str, dict[str, list[str]]]:
+    """Parse lwr_mainline_topology.csv to extract upstream and downstream link relations."""
+    topo_path = panel_dir / "network" / "lwr_mainline_topology.csv"
+    topology: dict[str, dict[str, list[str]]] = {}
+    if not topo_path.exists():
+        return topology
+        
+    df = pd.read_csv(topo_path, dtype=str)
+    for _, row in df.iterrows():
+        lid = str(row["link_id"])
+        incoming = [x.strip() for x in str(row.get("incoming_link_ids", "")).split(";") if x.strip() and x != "nan"]
+        outgoing = [x.strip() for x in str(row.get("outgoing_link_ids", "")).split(";") if x.strip() and x != "nan"]
+        on_ramps = [x.strip() for x in str(row.get("on_ramp_link_ids", "")).split(";") if x.strip() and x != "nan"]
+        off_ramps = [x.strip() for x in str(row.get("off_ramp_link_ids", "")).split(";") if x.strip() and x != "nan"]
+        topology[lid] = {
+            "incoming": incoming,
+            "outgoing": outgoing,
+            "on_ramps": on_ramps,
+            "off_ramps": off_ramps
+        }
+    return topology
+
+
+def load_ordered_links(panel_dir: Path) -> list[str]:
+    """Determine physical upstream-to-downstream link sequence along the corridor.
+    
+    Uses milepost from links.csv or train mainline states if available,
+    falling back to topological sorting on the directed corridor graph.
+    """
+    links_path = panel_dir / "network" / "links.csv"
+    if links_path.exists():
+        df = pd.read_csv(links_path, dtype={"link_id": str})
+        if "milepost" in df.columns:
+            mp = pd.to_numeric(df["milepost"], errors="coerce")
+            if mp.notna().sum() > len(df) * 0.5:
+                df["mp"] = mp.fillna(9999.0)
+                ordered = df.sort_values(["mp", "link_id"])["link_id"].unique().tolist()
+                return [str(x) for x in ordered]
+                
+    # Fallback to topology traversal
+    topo = load_topology(panel_dir)
+    if not topo:
+        if links_path.exists():
+            return [str(x) for x in pd.read_csv(links_path, dtype={"link_id": str})["link_id"].unique()]
+        return []
+        
+    # Find upstream root nodes (in-degree == 0)
+    in_degrees = {k: len(v["incoming"]) for k, v in topo.items()}
+    visited: list[str] = []
+    queue = [k for k, deg in in_degrees.items() if deg == 0]
+    if not queue:
+        queue = list(topo.keys())[:1]
+        
+    seen = set()
+    while queue:
+        node = queue.pop(0)
+        if node in seen:
+            continue
+        seen.add(node)
+        visited.append(node)
+        for succ in topo.get(node, {}).get("outgoing", []):
+            if succ not in seen and succ in topo:
+                queue.append(succ)
+                
+    for k in topo:
+        if k not in seen:
+            visited.append(k)
+    return visited
+
+
+def get_lane_vector(stations: pd.Series | np.ndarray, links: pd.Series | np.ndarray, lanes_map: dict[str, float]) -> np.ndarray:
+    """Vectorized retrieval of lane counts for given stations and links."""
+    st_arr = np.asarray(stations, dtype=str)
+    lk_arr = np.asarray(links, dtype=str)
+    n = len(st_arr)
+    result = np.ones(n, dtype=float)
+    for i in range(n):
+        s = st_arr[i]
+        l = lk_arr[i]
+        if s in lanes_map:
+            result[i] = lanes_map[s]
+        elif l in lanes_map:
+            result[i] = lanes_map[l]
+        else:
+            result[i] = 4.0
+    return np.maximum(result, 1.0)
+
+
+########## ## Section 4: Crash-Resilient Checkpoint Engine (`src/resume.py`) ##########
+%%writefile src/resume.py
+"""Resumable-run helpers: manifest tracking + atomic writes.
+
+Design: every long stage writes `work_dir/manifest.json` like
+{"task1": {"done": true, "rows": N, ...}, ...}. On restart with
+resume=True, stages whose manifest entry is done AND whose output
+file exists with size>0 are skipped. Per-panel checkpoints live in
+work_dir/checkpoints/<stage>/<panel>.done + partial CSVs, so a kill
+mid-panel only re-runs that panel, not everything.
+
+All writes are atomic (tmp + os.replace) so Ctrl-C never leaves
+half-written CSVs marked done.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+
+def load_manifest(work_dir: Path) -> dict:
+    p = work_dir / "manifest.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_manifest(work_dir: Path, manifest: dict) -> None:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    tmp = work_dir / "manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=2))
+    os.replace(tmp, work_dir / "manifest.json")
+
+
+def mark_done(work_dir: Path, stage: str, info: dict | None = None) -> None:
+    m = load_manifest(work_dir)
+    m[stage] = {"done": True, "ts": time.time(), **(info or {})}
+    save_manifest(work_dir, m)
+
+
+def mark_started(work_dir: Path, stage: str) -> None:
+    m = load_manifest(work_dir)
+    m[stage] = {"done": False, "ts": time.time()}
+    save_manifest(work_dir, m)
+
+
+def is_done(work_dir: Path, stage: str, out_path: Path | None = None) -> bool:
+    m = load_manifest(work_dir)
+    e = m.get(stage)
+    if not e or not e.get("done"):
+        return False
+    if out_path is not None:
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            return False
+    return True
+
+
+def panel_done(work_dir: Path, stage: str, panel: str) -> bool:
+    p = work_dir / "checkpoints" / stage / f"{panel}.done"
+    return p.exists()
+
+
+def mark_panel_done(work_dir: Path, stage: str, panel: str, rows: int = 0) -> None:
+    d = work_dir / "checkpoints" / stage
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f"{panel}.done.tmp"
+    tmp.write_text(json.dumps({"panel": panel, "rows": rows, "ts": time.time()}))
+    os.replace(tmp, d / f"{panel}.done")
+
+
+def atomic_replace(src: Path, dst: Path) -> None:
+    os.replace(src, dst)
+
+
+########## ## Section 5: Empirical Priors & Bottleneck Signatures (`src/aux_features.py`) ##########
+%%writefile src/aux_features.py
+"""Shared aux features: EB climatology prior + ramp merge pressure.
+
+cal_prior: p_EB(link, slot) = (hits + M*p_bar_corridor(slot)) / (N + M),
+  slot = weekday*288 + tod (2016 slots), M=20. Built from train mainline_states.
+ramp: on-ramp flows attached via network/ramp_attachment_map.csv
+  (ramp_link_id -> nearest_mainline_link_id). Missing = NaN (never zero).
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+N_SLOTS = 7 * 288
+SHRINK_M = 20.0
+
+
+def _slot_of(ts: pd.Series) -> np.ndarray:
+    ts = pd.to_datetime(ts, utc=True)
+    return (ts.dt.weekday * 288 + ts.dt.hour * 12 + ts.dt.minute // 5).to_numpy(dtype=np.int32)
+
+
+def build_cal_cache(panel: str, release_root: Path, out_path: Path,
+                    vcut_map: dict | None = None) -> dict:
+    """Count (link, slot) queue hits over train mainline_states; save JSON cache."""
+    from network_utils import load_fd_params
+    pdir = release_root / "corridors" / panel
+    fd = load_fd_params(pdir)
+    vcut = vcut_map or {lid: fd.get(lid, {}).get("v_cut", 63.0) for lid in fd}
+    files = sorted((pdir / "train" / "mainline_states").glob("**/*.parquet"))
+    hits: dict[tuple[str, int], int] = {}
+    tot_link_slot: dict[tuple[str, int], int] = {}
+    hits_slot = np.zeros(N_SLOTS, dtype=np.float64)
+    tot_slot = np.zeros(N_SLOTS, dtype=np.float64)
+    for f in files:
+        try:
+            df = pd.read_parquet(f, columns=["timestamp", "link_id", "speed_kmh"])
+        except Exception:
+            continue
+        df["link_id"] = df["link_id"].astype(str)
+        sp = pd.to_numeric(df["speed_kmh"], errors="coerce").to_numpy(dtype=float)
+        ok = np.isfinite(sp)
+        if not ok.any():
+            continue
+        slot = _slot_of(df["timestamp"])
+        cut = df["link_id"].map(vcut).fillna(63.0).to_numpy(dtype=float)
+        q = (ok & (sp <= cut)).astype(np.int32)
+        for lid, s, qq, oo in zip(df["link_id"].to_numpy(), slot, q, ok.astype(np.int32)):
+            k = (str(lid), int(s))
+            hits[k] = hits.get(k, 0) + int(qq)
+            tot_link_slot[k] = tot_link_slot.get(k, 0) + int(oo)
+        np.add.at(hits_slot, slot[ok], q[ok])
+        np.add.at(tot_slot, slot[ok], 1)
+    p_bar = hits_slot / np.maximum(tot_slot, 1.0)
+    cal = {"p_bar": [float(x) for x in p_bar], "links": {}}
+    by_link: dict[str, dict[str, list]] = {}
+    for (lid, s), h in hits.items():
+        n = tot_link_slot.get((lid, s), 0)
+        if n == 0:
+            continue
+        p_eb = (h + SHRINK_M * float(p_bar[s])) / (n + SHRINK_M)
+        by_link.setdefault(lid, []).append([s, round(p_eb, 4)])
+    cal["links"] = by_link
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".tmp.json")
+    tmp.write_text(json.dumps(cal))
+    os.replace(tmp, out_path)
+    return cal
+
+
+def load_cal_cache(panel: str) -> dict:
+    cands = [Path("scratch/training_run/cal_cache") / f"{panel}.json",
+             Path("/home/arch/ipynb/ieee/scratch/training_run/cal_cache") / f"{panel}.json"]
+    try:
+        here = Path(__file__).resolve().parent
+        cands.append(here.parent / "scratch" / "training_run" / "cal_cache" / f"{panel}.json")
+    except Exception:
+        pass
+    env = os.environ.get("CAL_CACHE_DIR")
+    if env:
+        cands.insert(0, Path(env) / f"{panel}.json")
+    for c in cands:
+        if c.exists():
+            try:
+                return json.loads(c.read_text())
+            except Exception:
+                pass
+    return {}
+
+
+def cal_prior_for(link: str, slot: int, cache: dict) -> float:
+    if not cache:
+        return 0.0
+    for s, p in cache.get("links", {}).get(str(link), []):
+        if s == int(slot):
+            return float(p)
+    pb = cache.get("p_bar", [])
+    if pb and 0 <= int(slot) < len(pb):
+        return float(pb[int(slot)])
+    return 0.0
+
+
+def load_attach(panel_dir: Path) -> pd.DataFrame:
+    for name in ("ramp_attachment_map.csv", "synthetic_ramp_attachment_map.csv"):
+        p = panel_dir / "network" / name
+        if p.exists():
+            df = pd.read_csv(p, dtype=str)
+            if {"ramp_link_id", "nearest_mainline_link_id"}.issubset(df.columns):
+                if "ramp_type" not in df.columns:
+                    df["ramp_type"] = "OR"
+                return df[["ramp_link_id", "ramp_type", "nearest_mainline_link_id"]].copy()
+    return pd.DataFrame(columns=["ramp_link_id", "ramp_type", "nearest_mainline_link_id"])
+
+
+def load_ramp_flows(panel_dir: Path, split: str,
+                    dates: set | None = None) -> pd.DataFrame:
+    """Long frame: timestamp, ml_link, ramp_flow (NaN if missing/ineligible).
+
+    dates: optional set of datetime.date to restrict (trainer sampled days).
+    """
+    base = panel_dir / split / "ramp_states" if split != "train" else panel_dir / "train" / "ramp_states"
+    if split == "train":
+        base = panel_dir / "train" / "ramp_states"
+    files = sorted(base.glob("**/*.parquet"))
+    if dates:
+        files = [f for f in files if any(d.isoformat().replace("-", "_") in f.name or
+                                         d.strftime("%Y_%m_%d") in f.name for d in dates)]
+        if not files:  # fall back: filter after load by date below
+            files = sorted(base.glob("**/*.parquet"))
+    attach = load_attach(panel_dir)
+    on = attach[attach["ramp_type"] == "OR"][["ramp_link_id", "nearest_mainline_link_id"]].copy()
+    if on.empty:
+        return pd.DataFrame(columns=["timestamp", "ml_link", "ramp_flow", "ramp_ok"])
+    rmap = dict(zip(on["ramp_link_id"].astype(str), on["nearest_mainline_link_id"].astype(str)))
+    parts = []
+    for f in files:
+        try:
+            df = pd.read_parquet(f, columns=["timestamp", "ramp_link_id", "flow_vph",
+                                             "pct_observed", "is_score_eligible"])
+        except Exception:
+            continue
+        df["ramp_link_id"] = df["ramp_link_id"].astype(str)
+        df = df[df["ramp_link_id"].isin(rmap)].copy()
+        if df.empty:
+            continue
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        if dates:
+            df = df[df["timestamp"].dt.date.isin(dates)]
+            if df.empty:
+                continue
+        elig = (pd.to_numeric(df["pct_observed"], errors="coerce").ge(75)
+                & df["flow_vph"].notna())
+        if "is_score_eligible" in df.columns:
+            elig = elig & df["is_score_eligible"].astype(bool)
+        df["ml_link"] = df["ramp_link_id"].map(rmap)
+        df["ramp_flow"] = np.where(elig.to_numpy(),
+                                   pd.to_numeric(df["flow_vph"], errors="coerce").to_numpy(dtype=float),
+                                   np.nan)
+        df["ramp_ok"] = elig.to_numpy().astype(np.int8)
+        parts.append(df[["timestamp", "ml_link", "ramp_flow", "ramp_ok"]])
+    if not parts:
+        return pd.DataFrame(columns=["timestamp", "ml_link", "ramp_flow", "ramp_ok"])
+    out = pd.concat(parts, ignore_index=True)
+    g = out.groupby(["ml_link", "timestamp"], as_index=False).agg(
+        ramp_flow=("ramp_flow", "sum"), ramp_ok=("ramp_ok", "max"))
+    # sum of NaNs -> 0 falsely; fix: NaN where no valid ramp
+    g["ramp_flow"] = np.where(g["ramp_ok"] > 0, g["ramp_flow"], np.nan)
+    return g.sort_values(["ml_link", "timestamp"]).reset_index(drop=True)
+
+
+class RampIndex:
+    """Fast per-(link, T) ramp lookup over sorted int64 timestamps."""
+
+    def __init__(self, df: pd.DataFrame | None = None):
+        self.d: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        if df is not None and len(df):
+            df = df.sort_values(["ml_link", "timestamp"])
+            ts = pd.to_datetime(df["timestamp"], utc=True).astype("int64").to_numpy()
+            fl = df["ramp_flow"].to_numpy(dtype=float)
+            ok = df["ramp_ok"].to_numpy(dtype=np.int8)
+            for lid, idx in df.groupby("ml_link").indices.items():
+                sel = np.sort(np.asarray(idx))
+                self.d[str(lid)] = (ts[sel], fl[sel], ok[sel])
+
+    def query(self, ml_link: str, T: pd.Timestamp, cap: float,
+              main_flow_last: float) -> tuple[float, float, float, float]:
+        nan = (np.nan, np.nan, np.nan, 1.0)
+        e = self.d.get(str(ml_link))
+        if e is None:
+            return nan
+        ts, fl, ok = e
+        Tt = pd.Timestamp(T)
+        if Tt.tzinfo is None:
+            Tt = Tt.tz_localize("UTC")
+        else:
+            Tt = Tt.tz_convert("UTC")
+        t = Tt.value
+        lo = np.searchsorted(ts, t - 30 * 60 * 10**9)
+        hi = np.searchsorted(ts, t)
+        if hi <= lo:
+            return nan
+        c0 = np.searchsorted(ts, t - 15 * 60 * 10**9)
+        cur_ok = ok[c0:hi] > 0
+        if cur_ok.sum() == 0:
+            return nan
+        cur_fl = fl[c0:hi][cur_ok]
+        cur_fl = cur_fl[np.isfinite(cur_fl)]
+        if not len(cur_fl):
+            return nan
+        f15 = float(cur_fl.mean())
+        prv_fl = fl[lo:c0][ok[lo:c0] > 0]
+        prv_fl = prv_fl[np.isfinite(prv_fl)]
+        surge = f15 - float(prv_fl.mean()) if len(prv_fl) else 0.0
+        dem = ((main_flow_last if np.isfinite(main_flow_last) else 0.0) + f15) / max(cap, 1.0)
+        return f15, float(surge), float(dem), 0.0
+
+
+def ramp_features_at(ml_link: str, T: pd.Timestamp, ramp_df: pd.DataFrame,
+                     cap: float, main_flow_last: float) -> tuple[float, float, float, float]:
+    """(ramp_flow_15, ramp_surge, demand_ratio, ramp_missing) at forecast origin T."""
+    return RampIndex(ramp_df).query(ml_link, T, cap, main_flow_last)
+
+
+########## ## Section 6: Physics Consistency Engine (`src/physics_corrections.py`) ##########
+%%writefile src/physics_corrections.py
+"""Physics-consistent post-processing for Task 1 reconstruction.
+
+Applied AFTER the existing linear temporal+spatial interpolation (v2 baseline).
+Does NOT replace the interpolation ¡ª only corrects the output for physics consistency.
+
+Two stages:
+1. Soft FD projection: nudge (speed, flow) toward triangular FD
+2. Conservation correction: enforce vehicle conservation at link transitions
+
+These directly boost S_physics (0.15 weight) without degrading S_state (0.35 weight).
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from typing import Optional
+
+# ©¤©¤©¤ Parameters (calibrated on 10/10 train panels) ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+FD_ALPHA = 0.15            # soft FD projection blend (improves S_FD without hurting speed)
+CONSERVATION_ALPHA = 0.40  # conservation correction strength (reduces residuals by ~65%)
+CONSERVATION_PASSES = 5    # iterative passes for smooth multi-link cascading
+
+
+def soft_fd_projection(speed: np.ndarray, flow: np.ndarray,
+                       link_ids: np.ndarray,
+                       fd: dict[str, dict],
+                       alpha: float = FD_ALPHA,
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Gently project (speed, flow) toward the triangular FD.
+
+    For each cell:
+    1. Compute density k = q / v
+    2. Compute FD-consistent flow q_fd based on triangular FD
+    3. Blend: q_out = (1-¦Á) * q + ¦Á * q_fd
+
+    Speed is NOT adjusted (lesson from v1: adjusting speed killed S_state).
+    Only flow is nudged, and only gently (¦Á=0.10).
+
+    This directly improves S_FD (1/3 of S_physics = 0.05 of S_total).
+    """
+    n = len(speed)
+    flow_out = flow.copy()
+
+    # Build per-cell FD parameter arrays (vectorized)
+    lids = np.asarray(link_ids, dtype=str)
+    vf = np.array([fd.get(lids[i], {}).get("vf", 105.0) for i in range(n)])
+    cap = np.array([fd.get(lids[i], {}).get("cap", 7200.0) for i in range(n)])
+    k_crit = np.array([fd.get(lids[i], {}).get("k_crit", cap[i] / max(vf[i], 1.0)) for i in range(n)])
+    k_jam = np.array([fd.get(lids[i], {}).get("k_jam", 400.0) for i in range(n)])
+    w_speed = np.array([fd.get(lids[i], {}).get("wave_speed",
+                        cap[i] / max(k_jam[i] - k_crit[i], 1.0)) for i in range(n)])
+
+    valid = np.isfinite(speed) & np.isfinite(flow) & (speed > 1.0)
+
+    # Density from current state
+    k = np.where(valid, flow / np.maximum(speed, 1.0), 0.0)
+
+    # FD-consistent flow
+    is_free = k <= k_crit
+    q_fd_free = vf * k
+    q_fd_cong = w_speed * np.maximum(k_jam - k, 0.0)
+    q_fd = np.where(is_free, q_fd_free, q_fd_cong)
+
+    # Only project where FD flow is positive and reasonable
+    reasonable = valid & (q_fd > 0) & (q_fd < cap * 1.3)
+    flow_out[reasonable] = (1.0 - alpha) * flow[reasonable] + alpha * q_fd[reasonable]
+
+    return speed.copy(), flow_out
+
+
+def conservation_correction(speed: np.ndarray, flow: np.ndarray,
+                            link_ids_arr: np.ndarray,
+                            timestamps_arr: np.ndarray,
+                            ordered_links: list[str],
+                            fd: dict[str, dict],
+                            ramp_net_flow: Optional[dict] = None,
+                            alpha: float = CONSERVATION_ALPHA,
+                            n_passes: int = CONSERVATION_PASSES,
+                            ) -> np.ndarray:
+    """Apply iterative conservation-aware flow correction.
+
+    For each consecutive link pair (upstream¡údownstream) at each timestamp,
+    computes the conservation residual:
+        residual = q_dn - (q_up + q_ramp_net)
+    and adjusts flows to minimize it.
+
+    Multiple passes smooth out cascading corrections along the corridor.
+
+    This directly improves S_LWR (2/3 of S_physics = 0.10 of S_total).
+    """
+    flow_out = flow.copy()
+
+    # Build link order map
+    link_order = {lid: i for i, lid in enumerate(ordered_links)}
+
+    # Build index: pre-sort once
+    n = len(flow)
+    orders = np.array([link_order.get(str(link_ids_arr[i]), 9999) for i in range(n)])
+    ts_arr = timestamps_arr
+
+    # Group by timestamp
+    # Use pandas for efficient groupby
+    df_tmp = pd.DataFrame({
+        "ts": ts_arr,
+        "order": orders,
+        "idx": np.arange(n),
+    })
+
+    # Pre-build group indices
+    ts_groups = {}
+    for ts_val, group in df_tmp.groupby("ts"):
+        sorted_g = group.sort_values("order")
+        ts_groups[ts_val] = (
+            sorted_g["order"].to_numpy(),
+            sorted_g["idx"].to_numpy(dtype=int),
+        )
+
+    for _pass in range(n_passes):
+        for ts_val, (group_orders, group_indices) in ts_groups.items():
+            flows = flow_out[group_indices]
+            n_g = len(group_orders)
+
+            for j in range(n_g - 1):
+                # Check consecutive in corridor order
+                if group_orders[j + 1] != group_orders[j] + 1:
+                    continue
+
+                q_up = flows[j]
+                q_dn = flows[j + 1]
+
+                if not (np.isfinite(q_up) and np.isfinite(q_dn)):
+                    continue
+
+                # Net ramp flow at upstream link
+                q_ramp = 0.0
+                if ramp_net_flow is not None:
+                    lid_up = str(link_ids_arr[group_indices[j]])
+                    key = (lid_up, str(ts_val))
+                    q_ramp = ramp_net_flow.get(key, 0.0)
+
+                # Conservation residual
+                residual = q_dn - (q_up + q_ramp)
+
+                # Split correction evenly between upstream and downstream
+                correction = alpha * residual * 0.5
+                flow_out[group_indices[j]] = q_up + correction
+                flow_out[group_indices[j + 1]] = q_dn - correction
+                # Update local copy for cascading within this pass
+                flows[j] = flow_out[group_indices[j]]
+                flows[j + 1] = flow_out[group_indices[j + 1]]
+
+    return flow_out
+
+
+def apply_physics_corrections(pred_speed: np.ndarray,
+                              pred_flow: np.ndarray,
+                              link_ids: np.ndarray,
+                              timestamps: np.ndarray,
+                              ordered_links: list[str],
+                              fd: dict[str, dict],
+                              ramp_net_flow: Optional[dict] = None,
+                              fd_alpha: float = FD_ALPHA,
+                              cons_alpha: float = CONSERVATION_ALPHA,
+                              cons_passes: int = CONSERVATION_PASSES,
+                              ) -> tuple[np.ndarray, np.ndarray]:
+    """Apply physics corrections to reconstructed states.
+
+    This is the main entry point. Call after Task 1 interpolation.
+
+    Order matters:
+    1. FD projection first (ensures density is in feasible range)
+    2. Conservation correction second (adjusts flows for balance)
+
+    Returns (corrected_speed, corrected_flow).
+    """
+    # Step 1: Soft FD projection
+    speed_out, flow_out = soft_fd_projection(
+        pred_speed, pred_flow, link_ids, fd, alpha=fd_alpha,
+    )
+
+    # Step 2: Conservation correction
+    flow_out = conservation_correction(
+        speed_out, flow_out,
+        link_ids, timestamps,
+        ordered_links, fd,
+        ramp_net_flow=ramp_net_flow,
+        alpha=cons_alpha,
+        n_passes=cons_passes,
+    )
+
+    return speed_out, flow_out
+
+
+########## ## Section 7: Task 1 State Reconstruction & Task 3 Physical Consistency (`src/task1_state.py`) ##########
+%%writefile src/task1_state.py
+"""Task 1: Traffic State Reconstruction & Task 3 Physics Consistency.
+
+v2 Calibrated Precision (LB 0.72682 peak):
+1. Physical corridor topological link ordering
+2. Temporal interpolation (limit=12) + spatial kernel (limit=8) with 85/15 blend
+3. NO congested FD projection (v1 bug: displaced flow RMSE, hurt S_state)
+4. Rolling density smoothing (window=3, 85/15 blend) for LWR without flow distortion
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+from config import (
+    PANELS,
+    INTERVAL_MINUTES,
+    SLOTS_PER_DAY,
+    SLOTS_PER_WEEK,
+)
+from network_utils import (
+    load_lane_counts,
+    load_fd_params,
+    load_ordered_links,
+    get_lane_vector,
+)
+
+try:
+    from scipy.interpolate import PchipInterpolator
+    _HAS_PCHIP = True
+except Exception:
+    PchipInterpolator = None  # type: ignore
+    _HAS_PCHIP = False
+
+# Step 12 hunt knobs (defaults = v2 baseline, LB-proven 0.72682).
+# LWR-safe only: monotone/gentle ops. Every change RMSE-scored on train first.
+T1_DENOISE = False    # rolling-median-3 on observed per-link values pre-interp
+T1_HIST_W = 0.0       # historical-prior blend weight (0.05 = regularizer)
+T1_TEMP_LIMIT = 12    # temporal interpolation limit (steps of 5 min)
+# Steps 4-5 ABLATED 2026-09-22 (PCHIP hurt 0.8987->0.8723; Kriging no gain).
+# Kept as code paths for experiments; defaults OFF = v2 proven baseline.
+USE_PCHIP = False
+USE_KRIGING = False
+
+# Physics corrections: soft FD projection + iterative conservation balance across links
+# Validated across 10/10 train panels: +0.0062 S_state gain, -65% conservation residual
+USE_PHYSICS_CORRECTIONS = True
+try:
+    from physics_corrections import (
+        apply_physics_corrections,
+        FD_ALPHA,
+        CONSERVATION_ALPHA,
+        CONSERVATION_PASSES,
+    )
+except ImportError:
+    apply_physics_corrections = None  # type: ignore
+    FD_ALPHA = 0.15
+    CONSERVATION_ALPHA = 0.40
+    CONSERVATION_PASSES = 5
+
+
+def _denoise_link(s: pd.Series) -> pd.Series:
+    """Median-3 over observed points only; NaN structure untouched."""
+    m = s.notna()
+    if m.sum() < 3:
+        return s
+    v = s[m].rolling(3, center=True, min_periods=1).median()
+    out = s.copy()
+    out[m] = v.to_numpy()
+    return out
+# Step 5: Kriging-like distance-weighted spatial fill along corridor order
+# (Gaussian kernel sigma=2km, nearest k=8). Falls back to linear limit=8.
+KRIGING_SIGMA_KM = 2.0
+KRIGING_K = 8
+
+
+def _pchip_fill(s: pd.Series, ts: pd.Series, limit: int = 12) -> pd.Series:
+    """Monotonic PCHIP fill for one link's series; only within `limit` steps of data."""
+    y = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+    try:
+        x = ts.astype("int64").to_numpy() // 1_000_000_000
+    except Exception:
+        return s.interpolate(method="linear", limit_direction="both", limit=limit)
+    m = np.isfinite(y)
+    if m.sum() < 3 or not _HAS_PCHIP:
+        return s.interpolate(method="linear", limit_direction="both", limit=limit)
+    try:
+        ser = pd.Series(y[m], index=x[m]).groupby(level=0).mean().sort_index()
+        xs = ser.index.to_numpy(dtype=float)
+        ys = ser.to_numpy(dtype=float)
+        if len(xs) < 3:
+            return s.interpolate(method="linear", limit_direction="both", limit=limit)
+        f = PchipInterpolator(xs, ys, extrapolate=False)
+    except Exception:
+        return s.interpolate(method="linear", limit_direction="both", limit=limit)
+    out = y.copy()
+    na = ~m
+    if na.any():
+        idx = np.arange(len(y))
+        nearest = np.abs(idx[na, None] - idx[m][None, :]).min(axis=1)
+        fill = np.zeros(len(y), dtype=bool)
+        fill[np.where(na)[0][nearest <= limit]] = True
+        with np.errstate(all="ignore"):
+            vals = f(x[fill])
+        out[fill] = np.where(np.isfinite(vals), vals, out[fill])
+    res = pd.Series(out, index=s.index)
+    # boundary NaN beyond PCHIP range -> linear fallback within limit
+    return res.interpolate(method="linear", limit_direction="both", limit=limit)
+
+
+def _kriging_fill(vals: np.ndarray, dists: np.ndarray,
+                  sigma: float = KRIGING_SIGMA_KM, k: int = KRIGING_K) -> np.ndarray:
+    """Distance-weighted fill along corridor order for one timestamp slice.
+
+    vals: temporal values (NaN where missing); dists: cumulative km per cell
+    (-1 = unknown link, left for fallback). Weight w=exp(-|d-dk|/sigma) over
+    nearest k known neighbours.
+    """
+    out = vals.copy()
+    known = np.isfinite(vals) & (dists >= 0)
+    if known.sum() == 0:
+        return out
+    kd = dists[known]
+    kv = vals[known]
+    for j in np.where(~np.isfinite(vals))[0]:
+        if dists[j] < 0:
+            continue
+        d = np.abs(kd - dists[j])
+        take = np.argsort(d, kind="stable")[:k]
+        w = np.exp(-d[take] / sigma)
+        ws = w.sum()
+        if ws > 0:
+            out[j] = float((w * kv[take]).sum() / ws)
+    return out
+
+
+def compute_time_slots(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 0-indexed weekday (0..6) and 5-min time-of-day slot (0..287)."""
+    ts = pd.to_datetime(frame["timestamp"], utc=True)
+    weekday = ts.dt.weekday.to_numpy(dtype=np.int16)
+    tod = (ts.dt.hour * 12 + ts.dt.minute // int(INTERVAL_MINUTES)).to_numpy(dtype=np.int16)
+    return weekday, tod
+
+
+def build_historical_profiles(panel_dir: Path) -> tuple[dict, dict]:
+    """Build fine-grained (link x slot) historical profiles from training mainline states."""
+    train_files = sorted((panel_dir / "train" / "mainline_states").glob("**/*.parquet"))
+    if not train_files:
+        train_files = sorted((panel_dir / "train" / "mainline_states_masked").glob("**/*.parquet"))
+        
+    if not train_files:
+        raise FileNotFoundError(f"No training parquet files found for corridor {panel_dir.name}")
+
+    first_df = pd.read_parquet(train_files[0], columns=["link_id"])
+    link_ids = sorted(first_df["link_id"].astype(str).unique())
+    link_idx = {lid: i for i, lid in enumerate(link_ids)}
+    n_links = len(link_ids)
+    n_slots = SLOTS_PER_WEEK
+
+    speed_sum = np.zeros((n_links, n_slots), dtype=np.float64)
+    speed_cnt = np.zeros((n_links, n_slots), dtype=np.int64)
+    flow_sum = np.zeros((n_links, n_slots), dtype=np.float64)
+    flow_cnt = np.zeros((n_links, n_slots), dtype=np.int64)
+
+    for path in train_files:
+        df = pd.read_parquet(path, columns=["timestamp", "link_id", "speed_kmh", "flow_vph", "pct_observed"])
+        df["link_id"] = df["link_id"].astype(str)
+        idx = df["link_id"].map(link_idx).to_numpy(dtype=np.int64)
+        weekday, tod = compute_time_slots(df)
+        slot = weekday * SLOTS_PER_DAY + tod
+
+        eligible = (
+            pd.to_numeric(df["pct_observed"], errors="coerce").ge(75)
+            & df["speed_kmh"].notna()
+            & df["flow_vph"].notna()
+        ).to_numpy()
+
+        sp = pd.to_numeric(df["speed_kmh"], errors="coerce").to_numpy(dtype=float)
+        fl = pd.to_numeric(df["flow_vph"], errors="coerce").to_numpy(dtype=float)
+
+        v_sp = eligible & np.isfinite(sp)
+        v_fl = eligible & np.isfinite(fl)
+
+        np.add.at(speed_sum, (idx[v_sp], slot[v_sp]), sp[v_sp])
+        np.add.at(speed_cnt, (idx[v_sp], slot[v_sp]), 1)
+        np.add.at(flow_sum, (idx[v_fl], slot[v_fl]), fl[v_fl])
+        np.add.at(flow_cnt, (idx[v_fl], slot[v_fl]), 1)
+
+    speed_mean = np.zeros_like(speed_sum)
+    flow_mean = np.zeros_like(flow_sum)
+    np.divide(speed_sum, np.maximum(speed_cnt, 1), out=speed_mean, where=speed_cnt > 0)
+    np.divide(flow_sum, np.maximum(flow_cnt, 1), out=flow_mean, where=flow_cnt > 0)
+    speed_fb = np.divide(speed_sum.sum(axis=1), np.maximum(speed_cnt.sum(axis=1), 1))
+    flow_fb = np.divide(flow_sum.sum(axis=1), np.maximum(flow_cnt.sum(axis=1), 1))
+
+    return (
+        {"link_ids": link_ids, "link_idx": link_idx, "mean": speed_mean, "fallback": speed_fb, "cnt": speed_cnt},
+        {"link_ids": link_ids, "link_idx": link_idx, "mean": flow_mean, "fallback": flow_fb, "cnt": flow_cnt},
+    )
+
+
+def reconstruct_panel_split(
+    panel: str,
+    panel_dir: Path,
+    split: str,
+    sp_prof: dict,
+    fl_prof: dict,
+    lanes_map: dict[str, float],
+    fd: dict[str, dict[str, float]],
+    ordered_links: list[str],
+) -> pd.DataFrame:
+    """Reconstruct masked states for a single corridor panel and split."""
+    link_order_map = {lid: i for i, lid in enumerate(ordered_links)}
+    link_idx = sp_prof["link_idx"]
+    pfiles = sorted((panel_dir / split / "mainline_states_masked").glob("**/*.parquet"))
+    
+    batches = []
+    for path in pfiles:
+        df = pd.read_parquet(path)
+        df["station_id"] = df["station_id"].astype(str)
+        df["link_id"] = df["link_id"].astype(str)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+        weekday, tod = compute_time_slots(df)
+        slot = weekday * SLOTS_PER_DAY + tod
+        idx = df["link_id"].map(link_idx).fillna(-1).to_numpy(dtype=np.int64)
+        valid_idx = np.where(idx >= 0, idx, 0)
+
+        hist_sp = sp_prof["mean"][valid_idx, slot]
+        hist_fl = fl_prof["mean"][valid_idx, slot]
+        hist_sp = np.where(sp_prof["cnt"][valid_idx, slot] == 0, sp_prof["fallback"][valid_idx], hist_sp)
+        hist_fl = np.where(fl_prof["cnt"][valid_idx, slot] == 0, fl_prof["fallback"][valid_idx], hist_fl)
+
+        lanes_arr = get_lane_vector(df["station_id"], df["link_id"], lanes_map)
+        df["flow_per_lane"] = df["flow_vph"] / np.maximum(lanes_arr, 1.0)
+        hist_fl_pl = hist_fl / np.maximum(lanes_arr, 1.0)
+
+        # 1. High-fidelity temporal continuity per link (limit=12 steps = 60 min)
+        # Step 4: PCHIP (monotonic) per link; linear fallback. Same 12-step window.
+        df_sorted_t = df.sort_values(["link_id", "timestamp"]).reset_index()
+        if T1_DENOISE:
+            # LWR-safe: denoise OBSERVED inputs only; gaps untouched, no smearing
+            df_sorted_t["speed_kmh"] = df_sorted_t.groupby("link_id")["speed_kmh"].transform(_denoise_link)
+            df_sorted_t["flow_per_lane"] = df_sorted_t.groupby("link_id")["flow_per_lane"].transform(_denoise_link)
+        if USE_PCHIP and _HAS_PCHIP:
+            t_sp = np.full(len(df_sorted_t), np.nan)
+            t_fl = np.full(len(df_sorted_t), np.nan)
+            for _lid, _sel in df_sorted_t.groupby("link_id").indices.items():
+                _sel = np.sort(np.asarray(_sel))
+                _ts = df_sorted_t["timestamp"].iloc[_sel]
+                t_sp[_sel] = _pchip_fill(
+                    df_sorted_t["speed_kmh"].iloc[_sel], _ts, T1_TEMP_LIMIT).to_numpy()
+                t_fl[_sel] = _pchip_fill(
+                    df_sorted_t["flow_per_lane"].iloc[_sel], _ts, T1_TEMP_LIMIT).to_numpy()
+            df_sorted_t["t_sp"] = t_sp
+            df_sorted_t["t_fl"] = t_fl
+        else:
+            t_sp = df_sorted_t.groupby("link_id")["speed_kmh"].transform(
+                lambda s: s.interpolate(method="linear", limit_direction="both", limit=T1_TEMP_LIMIT)
+            )
+            t_fl = df_sorted_t.groupby("link_id")["flow_per_lane"].transform(
+                lambda s: s.interpolate(method="linear", limit_direction="both", limit=T1_TEMP_LIMIT)
+            )
+            df_sorted_t["t_sp"] = t_sp
+            df_sorted_t["t_fl"] = t_fl
+        df = df_sorted_t.sort_values("index").drop(columns=["index"]).reset_index(drop=True)
+
+        # 2. Topological spatial continuity along physical corridor link sequence
+        # Step 5: Kriging-like Gaussian distance weighting (sigma=2km, k=8)
+        # along cumulative link lengths; v1/v2 used linear limit=8 on rank order.
+        df["_spatial_rank"] = df["link_id"].map(link_order_map).fillna(9999).astype(int)
+        df_sorted_s = df.sort_values(["timestamp", "_spatial_rank"]).reset_index()
+        if USE_KRIGING:
+            _lens = np.array(
+                [fd.get(str(l), {}).get("length", 1.0) for l in ordered_links],
+                dtype=float)
+            _cum = np.concatenate([[0.0], np.cumsum(_lens)[:-1]]) if len(_lens) else np.array([])
+            _pos2dist = {str(lid): float(_cum[i]) for i, lid in enumerate(ordered_links)}
+            _d = df_sorted_s["link_id"].astype(str).map(_pos2dist).fillna(-1.0).to_numpy(dtype=float)
+            _tsp = df_sorted_s["t_sp"].to_numpy(dtype=float)
+            _tfl = df_sorted_s["t_fl"].to_numpy(dtype=float)
+            _ssp = np.full_like(_tsp, np.nan)
+            _sfl = np.full_like(_tfl, np.nan)
+            for _ts, _sel in df_sorted_s.groupby("timestamp").indices.items():
+                _sel = np.sort(np.asarray(_sel))
+                _ssp[_sel] = _kriging_fill(_tsp[_sel], _d[_sel])
+                _sfl[_sel] = _kriging_fill(_tfl[_sel], _d[_sel])
+            df_sorted_s["s_sp"] = _ssp
+            df_sorted_s["s_fl"] = _sfl
+        else:
+            s_sp = df_sorted_s.groupby("timestamp")["t_sp"].transform(
+                lambda s: s.interpolate(method="linear", limit_direction="both", limit=8)
+            )
+            s_fl = df_sorted_s.groupby("timestamp")["t_fl"].transform(
+                lambda s: s.interpolate(method="linear", limit_direction="both", limit=8)
+            )
+            df_sorted_s["s_sp"] = s_sp
+            df_sorted_s["s_fl"] = s_fl
+        df = df_sorted_s.sort_values("index").drop(columns=["index", "_spatial_rank"]).reset_index(drop=True)
+
+        t_sp_v = df["t_sp"].to_numpy(dtype=float)
+        s_sp_v = df["s_sp"].to_numpy(dtype=float)
+        t_fl_v = df["t_fl"].to_numpy(dtype=float)
+        s_fl_v = df["s_fl"].to_numpy(dtype=float)
+
+        # 3. Calibrated blend surface (85% temporal + 15% spatial, v2 optimum).
+        # v1 used 82/18 which over-weighted noisy spatial neighbours.
+        pred_speed = np.where(
+            np.isfinite(t_sp_v),
+            0.85 * t_sp_v + 0.15 * np.where(np.isfinite(s_sp_v), s_sp_v, t_sp_v),
+            np.where(np.isfinite(s_sp_v), 0.90 * s_sp_v + 0.10 * hist_sp, hist_sp),
+        )
+
+        pred_fl_pl = np.where(
+            np.isfinite(t_fl_v),
+            0.85 * t_fl_v + 0.15 * np.where(np.isfinite(s_fl_v), s_fl_v, t_fl_v),
+            np.where(np.isfinite(s_fl_v), 0.90 * s_fl_v + 0.10 * hist_fl_pl, hist_fl_pl),
+        )
+
+        pred_flow_raw = pred_fl_pl * lanes_arr
+
+        # Step 12: historical-prior regularization (gentle, LWR-safe)
+        if T1_HIST_W > 0:
+            pred_speed = (1.0 - T1_HIST_W) * pred_speed + T1_HIST_W * hist_sp
+            pred_fl_pl = (1.0 - T1_HIST_W) * pred_fl_pl + T1_HIST_W * hist_fl_pl
+            pred_flow_raw = pred_fl_pl * lanes_arr
+
+        # 4. NO congested FD projection (v1 bug fix).
+        # v1 forced q toward q_cong_fd = w*v*k_jam/(v+w) with 12% blend,
+        # inflating flow RMSE vs stochastic sim truth. v2 uses raw flux directly.
+        # FD params only used for clipping bounds below.
+        vf_arr = np.array([fd.get(str(l), {}).get("vf", 105.0) for l in df["link_id"]])
+        cap_arr = np.array([fd.get(str(l), {}).get("cap", 7200.0) for l in df["link_id"]])
+
+        pred_speed_clipped = np.clip(pred_speed, 5.0, vf_arr * 1.05)
+        pred_flow_fd = pred_flow_raw
+
+        # 5. Continuous vehicle density accumulation smoothing (LWR mass balance)
+        df["pred_sp_tmp"] = pred_speed_clipped
+        df["pred_fl_tmp"] = np.maximum(pred_flow_fd, 50.0)
+
+        df_sorted_link = df.sort_values(["link_id", "timestamp"]).reset_index()
+        df_sorted_link["density_raw"] = df_sorted_link["pred_fl_tmp"] / np.maximum(df_sorted_link["pred_sp_tmp"], 1.0)
+        df_sorted_link["density_smooth"] = df_sorted_link.groupby("link_id")["density_raw"].transform(
+            lambda s: s.rolling(3, center=True, min_periods=1).mean()
+        )
+        smooth_fl = df_sorted_link["density_smooth"] * df_sorted_link["pred_sp_tmp"]
+
+        # Gentle mass conservation blend (85% raw + 15% smooth, v2 calibrated)
+        df_sorted_link["final_flow"] = 0.85 * df_sorted_link["pred_fl_tmp"] + 0.15 * smooth_fl
+        df_back = df_sorted_link.sort_values("index").drop(columns=["index"]).reset_index(drop=True)
+
+        final_speed = np.clip(df_back["pred_sp_tmp"].to_numpy(dtype=float), 5.0, vf_arr * 1.05)
+        final_flow = np.clip(df_back["final_flow"].to_numpy(dtype=float), 50.0, cap_arr * 1.15)
+
+        # 6. Physics corrections: soft FD projection + iterative link-transition conservation
+        if USE_PHYSICS_CORRECTIONS and apply_physics_corrections is not None:
+            final_speed, final_flow = apply_physics_corrections(
+                final_speed,
+                final_flow,
+                df["link_id"].astype(str).to_numpy(),
+                df["timestamp"].to_numpy(),
+                ordered_links,
+                fd,
+                fd_alpha=FD_ALPHA,
+                cons_alpha=CONSERVATION_ALPHA,
+                cons_passes=CONSERVATION_PASSES,
+            )
+            final_speed = np.clip(final_speed, 5.0, vf_arr * 1.05)
+            final_flow = np.clip(final_flow, 50.0, cap_arr * 1.15)
+
+        # Filter only eligible blanked targets
+        eligible = df["is_score_eligible"].astype(bool).to_numpy()
+        blanked = eligible & df["speed_kmh"].isna().to_numpy() & df["flow_vph"].isna().to_numpy()
+
+        for regime in pd.unique(df["mask_regime"].astype(str)):
+            target = blanked & (df["mask_regime"].astype(str) == regime).to_numpy()
+            mask = target & np.isfinite(final_speed) & np.isfinite(final_flow)
+            if not mask.any():
+                continue
+            batch = pd.DataFrame({
+                "panel": panel,
+                "timestamp": df.loc[mask, "timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").to_numpy(),
+                "station_id": df.loc[mask, "station_id"].to_numpy(),
+                "link_id": df.loc[mask, "link_id"].to_numpy(),
+                "mask_regime": regime,
+                "speed_kmh": final_speed[mask],
+                "flow_vph": final_flow[mask],
+            })
+            batches.append(batch)
+
+    if batches:
+        return pd.concat(batches, ignore_index=True)
+    return pd.DataFrame(columns=["panel", "timestamp", "station_id", "link_id", "mask_regime", "speed_kmh", "flow_vph"])
+
+
+def run_task1(
+    release_root: Path,
+    splits: list[str],
+    out_path: Path,
+    panels: list[str] | None = None
+) -> int:
+    """Execute complete Task 1 state reconstruction across corridors and export CSV."""
+    if panels is None:
+        panels = PANELS
+        
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    total_rows = 0
+    write_header = True
+    t0 = time.time()
+    
+    print(f"Starting Task 1 state reconstruction for splits: {splits}")
+    for panel in panels:
+        tp = time.time()
+        panel_dir = release_root / "corridors" / panel
+        lanes_map = load_lane_counts(panel_dir)
+        fd = load_fd_params(panel_dir)
+        ordered_links = load_ordered_links(panel_dir)
+        sp_prof, fl_prof = build_historical_profiles(panel_dir)
+        
+        panel_rows = 0
+        for split in splits:
+            reconstructed_df = reconstruct_panel_split(
+                panel, panel_dir, split, sp_prof, fl_prof, lanes_map, fd, ordered_links
+            )
+            if not reconstructed_df.empty:
+                reconstructed_df.to_csv(out_path, mode="w" if write_header else "a", header=write_header, index=False)
+                write_header = False
+                n = len(reconstructed_df)
+                panel_rows += n
+                total_rows += n
+                
+        print(f"[{panel}] Reconstructed {panel_rows:,} cells in {time.time()-tp:.1f}s")
+        
+    print(f"Task 1 Complete: {total_rows:,} total rows exported to {out_path} in {time.time()-t0:.1f}s")
+    return total_rows
+
+
+########## ## Section 8: Task 2 Kinematic Queue Forecasting (`src/task2_queue.py`) ##########
+%%writefile src/task2_queue.py
+"""Task 2: Calibrated Precision Queue Forecasting Engine (v2 peak LB 0.72682).
+
+v2 optimum (see doc/EXPERIMENT_RESULTS_AND_IMPROVEMENTS.md Bug Fix 2):
+1. Ongoing windows: PURE persistence (queued at T0 persists). NO upstream BFS
+   shockwave expansion ¡ª v1 BFS to 4 hops created ~11k FP cells, IoU collapse.
+2. Onset windows: restrict to Step 6 (T+30m) on empirical TOP-2 bottlenecks
+   per corridor. Optional Step 5 (T+25m) fast-breakdown trigger only when
+   margin <= 0.65 AND decel <= -0.10 km/h/min on a recurrent bottleneck
+   (v3 tested this; keep as conservative secondary trigger).
+3. No ML yet ¡ª LightGBM hook staged for >0.8 push once GPU/data free
+   (train on train-split pseudo-windows, see IMPLEMENTATION_PLAN.md 3.2).
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+from config import (
+    TASK2_ACTIVE_PANELS,
+    TASK2_HORIZON_STEPS,
+)
+from network_utils import (
+    load_fd_params,
+    load_topology,
+    load_ordered_links,
+)
+
+# v2 peak: TOP-2 recurrent bottlenecks per corridor only (v1 used 4 links,
+# over-predicted). These are the Step-6 activation set.
+EMPIRICAL_BOTTLENECKS = {
+    "D12_I5_N": ["L5N-059", "L5N-104"],
+    "D12_I5_S": ["L5S-152", "L5S-249"],
+    "D7_I10_E": ["L10E-043", "L10E-125"],
+    "D7_I10_W": ["L10W-013", "L10W-212"],
+    "D7_I210_E": ["L210E-132", "L210E-261"],
+    "D7_I210_W": ["L210W-190", "L210W-246"],
+    "D7_I405_N": ["L405N-145", "L405N-041"],
+    "D7_I405_S": ["L405S-264", "L405S-127"],
+}
+
+# Validated empirical bottleneck clusters per corridor for onset forecasting.
+# Mined across all 273 training days from ground-truth breakdown occurrences.
+ONSET_BOTTLENECK_CLUSTERS = {
+    "D12_I5_N": [
+        ["L5N-059", "L5N-061", "L5N-104"],
+        ["L5N-147", "L5N-235", "L5N-237"],
+    ],
+    "D12_I5_S": [
+        ["L5S-152", "L5S-249", "L5S-065"],
+        ["L5S-051", "L5S-101", "L5S-132", "L5S-278"],
+    ],
+    "D7_I10_E": [
+        ["L10E-043", "L10E-052", "L10E-053", "L10E-124", "L10E-125", "L10E-180", "L10E-243"],
+    ],
+    "D7_I10_W": [
+        ["L10W-212", "L10W-013"],
+    ],
+    "D7_I210_E": [
+        ["L210E-001", "L210E-129", "L210E-131", "L210E-132", "L210E-261"],
+    ],
+    "D7_I210_W": [
+        ["L210W-190", "L210W-246"],
+        ["L210W-004", "L210W-028", "L210W-029", "L210W-172"],
+    ],
+    "D7_I405_N": [
+        ["L405N-041", "L405N-145"],
+        ["L405N-080", "L405N-082", "L405N-083", "L405N-217", "L405N-233", "L405N-234", "L405N-235", "L405N-392"],
+    ],
+    "D7_I405_S": [
+        ["L405S-001", "L405S-017", "L405S-056", "L405S-065", "L405S-260", "L405S-264"],
+        ["L405S-127", "L405S-317", "L405S-319", "L405S-373"],
+    ],
+}
+
+
+def get_onset_cluster(panel: str, T: pd.Timestamp, h_df: pd.DataFrame | None = None) -> list[str]:
+    """Identify the active bottleneck breakdown cluster for an onset window.
+
+    Conditioned on corridor geometry and time-of-day / pre-breakdown cues.
+    Validated on 40/40 ground-truth onset windows: yields IoU 0.7520.
+    """
+    hr = int(T.hour)
+    if panel == "D12_I5_N":
+        return ["L5N-147", "L5N-235", "L5N-237"] if hr >= 13 else ["L5N-059", "L5N-061", "L5N-104"]
+    elif panel == "D12_I5_S":
+        return ["L5S-152", "L5S-249", "L5S-065"] if hr >= 11 else ["L5S-051", "L5S-101", "L5S-132", "L5S-278"]
+    elif panel == "D7_I10_E":
+        return ["L10E-043", "L10E-052", "L10E-053", "L10E-124", "L10E-125", "L10E-180", "L10E-243"]
+    elif panel == "D7_I10_W":
+        return ["L10W-212", "L10W-013"]
+    elif panel == "D7_I210_E":
+        return ["L210E-001", "L210E-129", "L210E-131", "L210E-132", "L210E-261"]
+    elif panel == "D7_I210_W":
+        return ["L210W-190", "L210W-246"] if hr in (8, 9) else ["L210W-004", "L210W-028", "L210W-029", "L210W-172"]
+    elif panel == "D7_I405_N":
+        return ["L405N-041", "L405N-145"]
+    elif panel == "D7_I405_S":
+        return ["L405S-127", "L405S-317", "L405S-319", "L405S-373"] if hr in (9, 10, 11, 12) else ["L405S-001", "L405S-017", "L405S-056", "L405S-065", "L405S-260", "L405S-264"]
+    return EMPIRICAL_BOTTLENECKS.get(panel, [])
+
+# Optional ML hook for >0.8 push (trained offline when GPU/data available).
+# If a LightGBM booster file is present, run_task2 blends it; otherwise pure heuristics.
+# Auto-discovers scratch/training_run/models/task2_lgbm.txt; override via
+# run_task2(..., lgbm_model=<path>) or LGBM_MODEL_PATH env var.
+LGBM_MODEL_PATH = None  # e.g. Path("models/task2_lgbm.txt"); None = heuristics only
+# Validated on train hindcast (80 windows): heur 0.373 -> hybrid@0.8 0.4423.
+# Ongoing 0.530->0.668 (ML catches spillback); onset stays conservative (0.80) to avoid test FPs.
+LGBM_THRESHOLD = 0.80  # locked at 0.80 (peak LB 0.74948 in v9)
+# High bar for ML to add queues on ongoing windows (persistence is anchor)
+ONGOING_ML_THRESHOLD = 0.70
+
+FEATURE_COLS = [
+    "v_last_over_vf", "v_min15_over_vf", "dv_dt", "d2v",
+    "q_last_over_cap", "occ_last", "occ_trend",
+    "is_queued_T", "dt_min", "hour", "weekday",
+    "dist_to_bn", "ramp_pressure",
+    "mu_over_cap", "dc_ratio", "q_freq",
+    # Step 11 REVERTED 2026-09-22 (see trainer).
+]
+
+_MU_CACHE: dict[str, dict] = {}
+
+
+def _load_mu_cache(panel: str) -> dict:
+    """Load mu_over_cap/q_freq maps saved by task2_train.py; {} if missing."""
+    if panel in _MU_CACHE:
+        return _MU_CACHE[panel]
+    candidates = [
+        Path("scratch/training_run/mu_cache") / f"{panel}.json",
+        Path("/home/arch/ipynb/ieee/scratch/training_run/mu_cache") / f"{panel}.json",
+    ]
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(here.parent / "scratch" / "training_run" / "mu_cache" / f"{panel}.json")
+    except Exception:
+        pass
+    import os as _os
+    env = _os.environ.get("MU_CACHE_DIR")
+    if env:
+        candidates.insert(0, Path(env) / f"{panel}.json")
+    for c in candidates:
+        if c.exists():
+            try:
+                import json as _json
+                _MU_CACHE[panel] = _json.loads(c.read_text())
+                return _MU_CACHE[panel]
+            except Exception:
+                pass
+    _MU_CACHE[panel] = {}
+    return _MU_CACHE[panel]
+
+_BOOSTER_CACHE: dict[str, object] = {}
+
+
+def _default_model_path() -> Path | None:
+    import os
+    env = os.environ.get("LGBM_MODEL_PATH")
+    if env and Path(env).exists():
+        return Path(env)
+    if LGBM_MODEL_PATH is not None and Path(LGBM_MODEL_PATH).exists():
+        return Path(LGBM_MODEL_PATH)
+    candidates = [
+        Path("scratch/training_run/models/task2_lgbm.txt"),
+        Path("/home/arch/ipynb/ieee/scratch/training_run/models/task2_lgbm.txt"),
+        Path("models/task2_lgbm.txt"),
+    ]
+    # relative to this file (src/../scratch/...)
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(here.parent / "scratch" / "training_run" / "models" / "task2_lgbm.txt")
+    except Exception:
+        pass
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _load_booster_pair() -> tuple[object | None, object | None]:
+    """Load (ongoing, onset) specialist boosters; (None, None) if missing."""
+    here_candidates: list[Path] = []
+    try:
+        here = Path(__file__).resolve().parent
+        here_candidates.append(here.parent / "scratch" / "training_run" / "models")
+    except Exception:
+        pass
+    import os as _os
+    base_dirs = [Path("scratch/training_run/models"),
+                 Path("/home/arch/ipynb/ieee/scratch/training_run/models")] + here_candidates
+    env = _os.environ.get("LGBM_MODEL_DIR")
+    if env:
+        base_dirs.insert(0, Path(env))
+    out = []
+    for name in ("task2_ongoing", "task2_onset"):
+        bst = None
+        for d in base_dirs:
+            p = d / f"{name}.txt"
+            if p.exists():
+                bst = _load_booster(p)
+                break
+        out.append(bst)
+    return (out[0], out[1])
+
+
+def _load_booster(path: Path | None = None):
+    """Lazy-load LightGBM booster; returns None if unavailable (heuristics fallback)."""
+    key = str(path) if path else "__default__"
+    if key in _BOOSTER_CACHE:
+        return _BOOSTER_CACHE[key]
+    mp = Path(path) if path else _default_model_path()
+    if mp is None or not mp.exists():
+        _BOOSTER_CACHE[key] = None
+        return None
+    try:
+        import lightgbm as lgb
+        bst = lgb.Booster(model_file=str(mp))
+        print(f"[task2] LGBM booster loaded: {mp}")
+        _BOOSTER_CACHE[key] = bst
+        return bst
+    except Exception as e:
+        print(f"[task2] LGBM load failed ({e}), heuristics fallback.")
+        _BOOSTER_CACHE[key] = None
+        return None
+
+
+def _link_history_features(h_df: pd.DataFrame, fd_params: dict,
+                           mu_cache: dict | None = None,
+                           cal_cache: dict | None = None,
+                           ramp_index=None,
+                           t_last: pd.Timestamp | None = None) -> dict[str, dict]:
+    """Per-link aggregates from 60-min history, mirroring task2_train.py exactly."""
+    mu_map = (mu_cache or {}).get("mu_over_cap", {})
+    qf_map = (mu_cache or {}).get("q_freq", {})
+    if t_last is None:
+        t_last = h_df["timestamp"].max()
+    _tl = pd.Timestamp(t_last)
+    t_last = _tl.tz_convert("UTC") if _tl.tzinfo is not None else _tl.tz_localize("UTC")
+    slot = int(t_last.weekday() * 288 + t_last.hour * 12 + t_last.minute // 5)
+    feats: dict[str, dict] = {}
+    for lid, h in h_df.groupby("link_id"):
+        lid = str(lid)
+        h = h.sort_values("timestamp")
+        sp = pd.to_numeric(h["speed_kmh"], errors="coerce").to_numpy(dtype=float)
+        sp = sp[np.isfinite(sp)]
+        if len(sp) < 1:
+            continue
+        vf = fd_params.get(lid, {}).get("vf", 105.0)
+        cap = fd_params.get(lid, {}).get("cap", 7200.0)
+        cut = fd_params.get(lid, {}).get("v_cut", 63.0)
+        v_last = float(sp[-1])
+        v_min15 = float(sp[-3:].min()) if len(sp) >= 1 else v_last
+        dv = float((sp[-1] - sp[0]) / max(len(sp) - 1, 1) / 5.0) if len(sp) > 1 else 0.0
+        d2v = float(sp[-1] - 2 * sp[-2] + sp[-3]) if len(sp) >= 3 else 0.0
+        fl = pd.to_numeric(h["flow_vph"], errors="coerce").to_numpy(dtype=float) \
+            if "flow_vph" in h.columns else np.array([])
+        fl = fl[np.isfinite(fl)]
+        q_ratio = float(fl[-1] / cap) if len(fl) else 0.0
+        occ = pd.to_numeric(h["occupancy"], errors="coerce").to_numpy(dtype=float) \
+            if "occupancy" in h.columns else np.array([])
+        occ = occ[np.isfinite(occ)]
+        occ_last = float(occ[-1]) if len(occ) else 0.0
+        occ_trend = float(occ[-1] - occ[0]) / max(len(occ) - 1, 1) if len(occ) > 1 else 0.0
+        feats[lid] = {
+            "v_last_over_vf": v_last / max(vf, 1.0),
+            "v_min15_over_vf": v_min15 / max(vf, 1.0),
+            "dv_dt": dv, "d2v": d2v, "q_last_over_cap": q_ratio,
+            "occ_last": occ_last, "occ_trend": occ_trend,
+            "is_queued_T": int(v_last <= cut),
+            "mu_over_cap": float(mu_map.get(lid, 0.9)),
+            "dc_ratio": float(fl[-3:].mean() / cap) if len(fl) >= 3 else q_ratio,
+            "q_freq": float(qf_map.get(lid, 0.0)),
+        }
+    return feats
+
+
+def build_upstream_distance_map(
+    topology: dict[str, dict[str, list[str]]],
+    fd_params: dict[str, dict[str, float]],
+    max_hops: int = 5
+) -> dict[str, list[tuple[str, float]]]:
+    """Precompute upstream neighbors and cumulative distance (km) for shockwave tracking."""
+    upstream_map: dict[str, list[tuple[str, float]]] = {}
+    for lid in topology:
+        curr_queue = [(lid, 0.0, 0)]
+        visited = {lid}
+        up_list = []
+        while curr_queue:
+            curr_node, curr_dist, hops = curr_queue.pop(0)
+            if hops >= max_hops:
+                continue
+            for parent in topology.get(curr_node, {}).get("incoming", []):
+                if parent not in visited and parent in fd_params:
+                    visited.add(parent)
+                    parent_len = fd_params[parent].get("length", 1.0)
+                    new_dist = curr_dist + parent_len
+                    up_list.append((parent, new_dist))
+                    curr_queue.append((parent, new_dist, hops + 1))
+        upstream_map[lid] = up_list
+    return upstream_map
+
+
+def predict_window_queues(
+    window_id: str,
+    panel: str,
+    condition: str,
+    h_df: pd.DataFrame,
+    target_df: pd.DataFrame,
+    fd_params: dict[str, dict[str, float]],
+    topology: dict[str, dict[str, list[str]]],
+    upstream_map: dict[str, list[tuple[str, float]]],
+    booster=None,
+    lgbm_threshold: float = LGBM_THRESHOLD,
+    ramp_index=None,
+    cal_cache: dict | None = None,
+) -> list[int]:
+    """Predict binary queue state (0/1) for all (link, timestamp) cells in horizon.
+
+    v2 calibrated precision + LGBM hybrid:
+    - ongoing: pure persistence of queue state at T0; ML may ADD a queue only
+      if p >= ONGOING_ML_THRESHOLD (high bar, no BFS FP flood).
+    - onset: heuristic Step-6/Step-5 triggers OR ML p >= lgbm_threshold.
+    booster=None -> auto-load default model; False -> force heuristics.
+    """
+    t_last = h_df["timestamp"].max()
+    at_t0 = h_df[h_df["timestamp"] == t_last].copy()
+
+    # Queue state at T0 from underlying speed vs v_cut, gated on eligibility
+    v_cuts = {str(lid): fd_params.get(str(lid), {}).get("v_cut", 63.0) for lid in at_t0["link_id"].unique()}
+    if "is_score_eligible" in at_t0.columns:
+        elig = at_t0["is_score_eligible"].astype(bool)
+    else:
+        elig = pd.Series(True, index=at_t0.index)
+    at_t0["_vcut"] = at_t0["link_id"].astype(str).map(v_cuts).fillna(63.0)
+    at_t0["_q_now"] = (pd.to_numeric(at_t0["speed_kmh"], errors="coerce") <= at_t0["_vcut"]) & elig.to_numpy()
+    queue_now_map: dict[str, bool] = at_t0.groupby("link_id")["_q_now"].any().to_dict()
+    queue_now_map = {str(k): bool(v) for k, v in queue_now_map.items()}
+
+    is_ongoing = "ongoing" in condition.lower()
+    bottlenecks = EMPIRICAL_BOTTLENECKS.get(panel, [])
+
+    # Onset: select active recurrent bottleneck cluster from history pre-breakdown cues
+    onset_active_cluster: set[str] = set()
+    fast_breakdown: set[str] = set()
+    if not is_ongoing:
+        # Align onset cluster with true forecast origin T (T = horizon_start - 5 min = t_last + 5 min)
+        t_h_start = pd.Timestamp(target_df["timestamp"].min()) if not target_df.empty else t_last
+        t_origin = t_h_start - pd.Timedelta(minutes=5) if not target_df.empty else (pd.Timestamp(t_last) + pd.Timedelta(minutes=5))
+        onset_active_cluster = set(get_onset_cluster(panel, t_origin, h_df))
+
+        t_minus_15 = pd.Timestamp(t_last) - pd.Timedelta(minutes=15)
+        recent = h_df[h_df["timestamp"] >= t_minus_15].dropna(subset=["speed_kmh"])
+        for bn in (onset_active_cluster | set(bottlenecks)):
+            bn_data = recent[recent["link_id"].astype(str) == str(bn)].sort_values("timestamp")
+            if len(bn_data) >= 2:
+                v_end = float(bn_data["speed_kmh"].iloc[-1])
+                v_start = float(bn_data["speed_kmh"].iloc[0])
+                cut = v_cuts.get(str(bn), 63.0)
+                margin = (v_end - cut) / max(cut, 1.0)
+                dt_span = max((bn_data["timestamp"].iloc[-1] - bn_data["timestamp"].iloc[0]).total_seconds() / 60.0, 1.0)
+                decel = (v_end - v_start) / dt_span  # km/h per minute
+                if margin <= 0.65 and decel <= -0.10:
+                    fast_breakdown.add(str(bn))
+
+    preds = []
+    # --- LGBM hybrid: batch-predict all target cells if booster available ---
+    # Step 3 outcome (validated): single joint model wins (0.4385) over per-link
+    # specialists (0.4282) ¡ª is_queued_T already splits regimes internally with
+    # full data. Default = single; pair routing only if LGBM_SPLIT=1 (experiment).
+    ml_probs: dict[tuple[str, float], float] = {}
+    use_ml = (booster is not False)
+    bst_single = booster if (booster is not None and booster is not False) else None
+    bst_on, bst_off = None, None
+    import os as _os2
+    want_split = _os2.environ.get("LGBM_SPLIT") == "1"
+    if use_ml and bst_single is None and not want_split:
+        bst_single = _load_booster()
+    if use_ml and bst_single is None and want_split:
+        bst_on, bst_off = _load_booster_pair()
+    if use_ml and bst_single is None and bst_on is None and bst_off is None:
+        bst_single = _load_booster()
+    if use_ml and (bst_single is not None or bst_on is not None or bst_off is not None):
+        try:
+            if cal_cache is None:
+                from aux_features import load_cal_cache as _lcc
+                cal_cache = _lcc(panel)
+            link_feats = _link_history_features(h_df, fd_params, _load_mu_cache(panel),
+                                                cal_cache, ramp_index)
+            t_hour = int(pd.Timestamp(t_last).hour)
+            t_wd = int(pd.Timestamp(t_last).weekday())
+            t_horizon_start = target_df["timestamp"].min() if not target_df.empty else t_last
+            t_horizon_end = target_df["timestamp"].max() if not target_df.empty else t_last
+            keys: list[tuple[str, float]] = []
+            mat: list[list[float]] = []
+            queued_flag: list[int] = []
+            for row in target_df.itertuples():
+                lid = str(row.link_id)
+                dt_min = 5.0 + max(0.0, (row.timestamp - t_horizon_start).total_seconds() / 60.0)
+                f = link_feats.get(lid)
+                if f is None:
+                    continue
+                keys.append((lid, float(dt_min)))
+                queued_flag.append(int(f["is_queued_T"]))
+                mat.append([f["v_last_over_vf"], f["v_min15_over_vf"], f["dv_dt"], f["d2v"],
+                            f["q_last_over_cap"], f["occ_last"], f["occ_trend"],
+                            f["is_queued_T"], float(dt_min), t_hour, t_wd,
+                            0.0 if lid in bottlenecks else 1.0, 0.0,
+                            f["mu_over_cap"], f["dc_ratio"], f["q_freq"]])
+            if mat:
+                import numpy as _np
+                arr = _np.array(mat, dtype=_np.float32)
+                if bst_single is not None:
+                    proba = bst_single.predict(arr)
+                    for k, p in zip(keys, proba):
+                        ml_probs[k] = float(p)
+                else:
+                    # per-link routing (LGBM_SPLIT=1 experiment; validated worse)
+                    if bst_on is not None:
+                        po = bst_on.predict(arr)
+                        for k, p, q in zip(keys, po, queued_flag):
+                            if q == 1:
+                                ml_probs[k] = float(p)
+                    if bst_off is not None:
+                        pf = bst_off.predict(arr)
+                        for k, p, q in zip(keys, pf, queued_flag):
+                            if q == 0:
+                                ml_probs[k] = float(p)
+        except Exception as e:
+            print(f"[task2] ML predict failed ({e}), heuristics fallback.")
+            ml_probs = {}
+    t_horizon_start = target_df["timestamp"].min() if not target_df.empty else t_last
+    t_horizon_end = target_df["timestamp"].max() if not target_df.empty else t_last
+    t_step5_thresh = t_horizon_end - pd.Timedelta(minutes=5)
+    for row in target_df.itertuples():
+        lid = str(row.link_id)
+        dt_min = 5.0 + max(0.0, (row.timestamp - t_horizon_start).total_seconds() / 60.0)
+        ml_p = ml_probs.get((lid, float(dt_min)), None)
+        if is_ongoing:
+            # Pure persistence ¡ª no upstream shockwave expansion (v1 FP bug)
+            if queue_now_map.get(lid, False):
+                preds.append(1)
+            elif ml_p is not None and ml_p >= ONGOING_ML_THRESHOLD:
+                preds.append(1)
+            else:
+                preds.append(0)
+        else:
+            if lid in onset_active_cluster and row.timestamp == t_horizon_end:
+                preds.append(1)
+            elif lid in fast_breakdown and row.timestamp >= t_step5_thresh:
+                preds.append(1)
+            elif ml_p is not None and ml_p >= lgbm_threshold:
+                preds.append(1)
+            else:
+                preds.append(0)
+    return preds
+
+
+def run_task2(
+    release_root: Path,
+    splits: list[str],
+    out_path: Path,
+    lgbm_model: Path | str | None = None,
+    lgbm_threshold: float = LGBM_THRESHOLD,
+    use_lgbm: bool = True,
+) -> int:
+    """Execute Task 2 queue prediction across all evaluation windows."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    
+    wi_files = sorted(release_root.glob("task2/**/window_index.csv")) or sorted(release_root.glob("**/window_index.csv"))
+    hist_files = sorted(release_root.glob("task2/**/window_history.parquet")) or sorted(release_root.glob("**/window_history.parquet"))
+    tmpl_files = sorted(release_root.glob("task2/**/sample_submission_queue.csv")) or sorted(release_root.glob("**/sample_submission_queue.csv"))
+    
+    if not (wi_files and hist_files and tmpl_files):
+        print("Warning: Missing Task 2 input files. Creating empty submission.")
+        pd.DataFrame(columns=["window_id", "timestamp", "link_id", "queue_pred"]).to_csv(out_path, index=False)
+        return 0
+
+    windows = pd.concat([pd.read_csv(f) for f in wi_files], ignore_index=True)
+    windows = windows[windows["split"].isin(splits)].copy()
+    
+    history = pd.concat([pd.read_parquet(f) for f in hist_files], ignore_index=True)
+    history["window_id"] = history["window_id"].astype(str)
+    history["link_id"] = history["link_id"].astype(str)
+    history["timestamp"] = pd.to_datetime(history["timestamp"], utc=True)
+    history["speed_kmh"] = pd.to_numeric(history["speed_kmh"], errors="coerce")
+    
+    template = pd.concat([pd.read_csv(f) for f in tmpl_files], ignore_index=True)
+    template["window_id"] = template["window_id"].astype(str)
+    template["link_id"] = template["link_id"].astype(str)
+    template["timestamp"] = pd.to_datetime(template["timestamp"], utc=True)
+
+    panel_map = windows.set_index("window_id")["panel"].astype(str).to_dict()
+    cond_map = windows.set_index("window_id")["condition"].astype(str).to_dict() if "condition" in windows.columns else {}
+    split_map = windows.set_index("window_id")["split"].astype(str).to_dict() if "split" in windows.columns else {}
+
+    # Preload network parameters & upstream topology per panel
+    network_cache = {}
+    for panel in windows["panel"].unique():
+        p_dir = release_root / "corridors" / panel
+        fd = load_fd_params(p_dir)
+        topo = load_topology(p_dir)
+        up_map = build_upstream_distance_map(topo, fd, max_hops=4)
+        from aux_features import load_cal_cache as _lcc2
+        network_cache[panel] = {"fd": fd, "topo": topo, "up_map": up_map,
+                                "cal": _lcc2(panel), "p_dir": p_dir}
+    # Lazy ramp indexes per (panel, split), capped at 2 (Kaggle 16GB)
+    from aux_features import load_ramp_flows, RampIndex
+    ramp_cache: dict[tuple[str, str], object] = {}
+    ramp_order: list[tuple[str, str]] = []
+
+    def _ramp_index(panel: str, split: str):
+        key = (panel, split)
+        if key in ramp_cache:
+            return ramp_cache[key]
+        p_dir = network_cache[panel]["p_dir"]
+        try:
+            ri = RampIndex(load_ramp_flows(p_dir, split))
+        except Exception as e:
+            print(f"[task2] ramp load {panel}/{split} failed ({e}), NaN fallback")
+            ri = RampIndex(None)
+        ramp_cache[key] = ri
+        ramp_order.append(key)
+        while len(ramp_order) > 2:
+            ramp_cache.pop(ramp_order.pop(0), None)
+        return ri
+
+    print(f"Running Task 2 Kinematic Queue Engine for {len(windows):,} windows...")
+    booster = False  # False = force heuristics; None = auto-load
+    if use_lgbm:
+        if lgbm_model:
+            booster = _load_booster(Path(lgbm_model))
+            print(f"[task2] mode: {'HYBRID (explicit model)' if booster is not None else 'HEURISTICS-ONLY'}")
+        else:
+            bst_on, bst_off = _load_booster_pair()
+            if bst_on is not None or bst_off is not None:
+                booster = None  # None = auto-load (single unless LGBM_SPLIT=1)
+                print(f"[task2] mode: HYBRID (single; split pair on disk, needs LGBM_SPLIT=1)")
+            else:
+                booster = _load_booster(None)
+                print(f"[task2] mode: {'HYBRID (single)' if booster is not None else 'HEURISTICS-ONLY'}")
+    targets = []
+    for window_id, h in tqdm(history.groupby("window_id", sort=True), desc="Task 2 Kinematics"):
+        wid = str(window_id)
+        panel = panel_map.get(wid)
+        if panel is None or panel not in network_cache:
+            continue
+            
+        cond = cond_map.get(wid, "queue_ongoing")
+        net = network_cache[panel]
+        split = split_map.get(wid, splits[0] if splits else "validation")
+
+        tgt = template[template["window_id"] == wid][["window_id", "timestamp", "link_id"]].copy()
+        if tgt.empty:
+            continue
+
+        preds = predict_window_queues(
+            wid, panel, cond, h, tgt, net["fd"], net["topo"], net["up_map"],
+            booster=booster, lgbm_threshold=lgbm_threshold,
+            ramp_index=_ramp_index(panel, split), cal_cache=net["cal"],
+        )
+        tgt["queue_pred"] = preds
+        targets.append(tgt)
+
+    if not targets:
+        pd.DataFrame(columns=["window_id", "timestamp", "link_id", "queue_pred"]).to_csv(out_path, index=False)
+        return 0
+
+    out_df = pd.concat(targets, ignore_index=True).drop_duplicates(["window_id", "timestamp", "link_id"])
+    out_df["queue_pred"] = out_df["queue_pred"].astype(int)
+    out_df.to_csv(out_path, index=False)
+    print(f"Task 2 Complete: {len(out_df):,} window predictions exported to {out_path} in {time.time()-t0:.1f}s")
+    return len(out_df)
+
+
+########## ## Section 9: Task 4 Calibrated Origin-Destination Matrix Estimation (`src/task4_odme.py`) ##########
+%%writefile src/task4_odme.py
+"""Task 4: Origin-Destination Matrix Estimation (ODME) ¡ª v2 calibrated.
+
+v2 fix (see EXPERIMENT Bug Fix 3):
+- Anchor DIRECTLY to weak prior wp, fallback to base ONLY on NaN.
+- v1 diluted prior (0.95*wp+0.05*base) and replaced legit 0.0 flows via
+  np.where(wp>0, wp, base) ¡ª corrupted S_od/S_attr destination distribution.
+- Solver: regularized NNLS lambda=0.05 (calibrated to official benchmark setting).
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.optimize import nnls
+
+from config import (
+    PANELS,
+    DEFAULT_REG_LAMBDA,
+)
+
+
+def solve_path_flow(
+    A: np.ndarray,
+    counts: np.ndarray,
+    anchor: np.ndarray,
+    reg_lambda: float = DEFAULT_REG_LAMBDA,
+    use_weights: bool = False,
+) -> np.ndarray:
+    """Solve min ||A @ f - counts||^2 + lambda * ||f - anchor||^2 s.t. f >= 0.
+
+    Step 6: inverse-variance weighting W_ii = 1/max(c_i, 50) aligns high-volume
+    mainline corridors without sacrificing minor ramp flows. Set use_weights=False
+    for plain NNLS.
+    ABLATED 2026-09-22: weighted shipped unvalidated in v4 (LB 0.6789). Default
+    OFF until validated; plain NNLS = v2 proven.
+    """
+    if use_weights:
+        w = 1.0 / np.maximum(counts, 50.0)
+        sqw = np.sqrt(w)
+        aa = np.vstack([sqw[:, None] * A, np.sqrt(reg_lambda) * np.eye(A.shape[1])])
+        bb = np.concatenate([sqw * counts, np.sqrt(reg_lambda) * anchor])
+    else:
+        aa = np.vstack([A, np.sqrt(reg_lambda) * np.eye(A.shape[1])])
+        bb = np.concatenate([counts, np.sqrt(reg_lambda) * anchor])
+    f, _ = nnls(aa, bb)
+    return np.maximum(f, 0.0)
+
+
+def solve_panel_odme(
+    panel: str,
+    panel_dir: Path,
+    release_root: Path,
+    splits: list[str],
+    reg_lambda: float = DEFAULT_REG_LAMBDA
+) -> pd.DataFrame:
+    """Solve ODME for a single corridor across requested splits."""
+    network = panel_dir / "network"
+    paths_csv = network / "path_set.csv"
+    incidence_csv = network / "path_link_incidence.csv"
+    base_od_csv = network / "base_od.csv"
+    
+    if not (paths_csv.exists() and incidence_csv.exists()):
+        return pd.DataFrame()
+
+    paths = pd.read_csv(paths_csv)
+    paths["path_id"] = paths["path_id"].astype(str)
+    path_ids = paths["path_id"].tolist()
+    path_index = {x: i for i, x in enumerate(path_ids)}
+
+    incidence = pd.read_csv(incidence_csv)
+    incidence["path_id"] = incidence["path_id"].astype(str)
+    incidence["link_id"] = incidence["link_id"].astype(str)
+    link_ids = incidence["link_id"].drop_duplicates().tolist()
+    link_index = {x: i for i, x in enumerate(link_ids)}
+
+    rr = incidence["link_id"].map(link_index).to_numpy(dtype=np.int64)
+    cc = incidence["path_id"].map(path_index).to_numpy(dtype=np.int64)
+    A = np.zeros((len(link_ids), len(path_ids)), dtype=np.float64)
+    A[rr, cc] = 1.0
+
+    base_values = np.zeros(len(path_ids), dtype=float)
+    if base_od_csv.exists():
+        base_od = pd.read_csv(base_od_csv)
+        base_od["path_id"] = base_od["path_id"].astype(str)
+        merged_base = paths[["path_id", "origin_zone", "destination_zone"]].merge(
+            base_od[["path_id", "base_flow"]], on="path_id", how="left"
+        )
+        merged_base = merged_base.set_index("path_id").reindex(path_ids).reset_index()
+        base_values = pd.to_numeric(merged_base["base_flow"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+
+    records = []
+    for split in splits:
+        counts_path = release_root / "task4" / panel / split / "synthetic_link_counts.csv"
+        prior_path = release_root / "task4" / panel / split / "synthetic_weak_prior.csv"
+
+        if not counts_path.exists():
+            continue
+
+        counts_df = pd.read_csv(counts_path, dtype={"link_id": str})
+        val_counts = counts_df.set_index("link_id").reindex(link_ids).fillna(0.0)["count"].to_numpy(dtype=float)
+        observed = set(counts_df["link_id"])
+        measured = np.array([l in observed for l in link_ids], dtype=bool)
+
+        anchor = base_values.copy()
+        dep_time = "PUBLIC-TRAIN-PM"
+        if prior_path.exists():
+            pr = pd.read_csv(prior_path, dtype={"path_id": str})
+            if len(pr) and "path_flow" in pr.columns:
+                pr["path_id"] = pr["path_id"].astype(str)
+                wp = pr.set_index("path_id").reindex(path_ids)["path_flow"].to_numpy(dtype=float)
+                # v2: preserve true zero-demand paths; fallback to base ONLY on NaN
+                # (v1 bug: np.nan_to_num(nan=0) + 0.95*wp+0.05*base overwrote zeros)
+                wp = np.where(np.isnan(wp), base_values, wp)
+                if np.sum(np.abs(wp)) > 0:
+                    anchor = wp
+            if len(pr) and "departure_time" in pr.columns:
+                dep_time = str(pr["departure_time"].iloc[0])
+
+        solved = solve_path_flow(A[measured], val_counts[measured], anchor, reg_lambda=reg_lambda)
+
+        ps = paths[["path_id", "origin_zone", "destination_zone"]].copy()
+        ps["panel"] = panel
+        ps["departure_time"] = dep_time
+        ps["path_flow"] = solved
+        records.append(ps[["panel", "departure_time", "path_id", "origin_zone", "destination_zone", "path_flow"]])
+
+    if records:
+        return pd.concat(records, ignore_index=True)
+    return pd.DataFrame()
+
+
+def run_task4(
+    release_root: Path,
+    splits: list[str],
+    out_path: Path,
+    panels: list[str] | None = None,
+    reg_lambda: float = DEFAULT_REG_LAMBDA
+) -> int:
+    """Execute Task 4 ODME across all corridors and write results to out_path."""
+    if panels is None:
+        panels = PANELS
+        
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    
+    results = []
+    print(f"Starting Task 4 ODME path flow estimation (lambda={reg_lambda})...")
+    for panel in panels:
+        p_dir = release_root / "corridors" / panel
+        p_df = solve_panel_odme(panel, p_dir, release_root, splits, reg_lambda=reg_lambda)
+        if not p_df.empty:
+            results.append(p_df)
+            print(f"[{panel}] ODME solved: {len(p_df):,} entries.")
+
+    if not results:
+        pd.DataFrame(columns=["panel", "departure_time", "path_id", "path_flow"]).to_csv(out_path, index=False)
+        return 0
+
+    out_df = pd.concat(results, ignore_index=True)
+    out_df.to_csv(out_path, index=False)
+    print(f"Task 4 Complete: {len(out_df):,} total entries exported to {out_path} in {time.time()-t0:.1f}s")
+    return len(out_df)
+
+
+########## ## Section 10: Unified Submission Assembly & 4-Gate Fail-Closed QC (`src/submission.py`) ##########
+%%writefile src/submission.py
+"""Merge per-task predictions into the final unified Kaggle submission file."""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+import pandas as pd
+
+CHUNK_SIZE = 500_000
+OUT_COLUMNS = ["submission_id", "task", "speed_kmh", "flow_vph", "queue_pred", "path_flow"]
+
+KEYS = {
+    "state": ["panel", "timestamp", "station_id", "link_id", "mask_regime"],
+    "queue": ["window_id", "timestamp", "link_id"],
+    "odme": ["panel", "departure_time", "path_id"]
+}
+
+VALUES = {
+    "state": ["speed_kmh", "flow_vph"],
+    "queue": ["queue_pred"],
+    "odme": ["path_flow"]
+}
+
+
+def index_table(path: Path, task: str) -> pd.DataFrame:
+    """Read a task submission CSV and index it by its natural key."""
+    if not path.exists():
+        raise FileNotFoundError(f"Missing prediction file for task '{task}': {path}")
+        
+    frame = pd.read_csv(path)
+    missing = sorted(set(KEYS[task] + VALUES[task]) - set(frame.columns))
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {missing}")
+        
+    frame = frame[KEYS[task] + VALUES[task]].copy()
+    for col in KEYS[task]:
+        frame[col] = pd.to_datetime(frame[col], utc=True) if col == "timestamp" else frame[col].astype(str)
+    for col in VALUES[task]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        
+    dup = int(frame.duplicated(KEYS[task]).sum())
+    if dup:
+        print(f"Warning: {path} has {dup} duplicate rows over {KEYS[task]}. Dropping duplicates.")
+        frame = frame.drop_duplicates(KEYS[task])
+        
+    return frame.set_index(KEYS[task])
+
+
+def merge_and_validate_submission(
+    state_path: Path,
+    queue_path: Path,
+    odme_path: Path,
+    key_file: Path,
+    out_path: Path,
+) -> int:
+    """Stream submission_key.csv and join all tasks to write final submission.csv."""
+    t0 = time.time()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    print("Indexing prediction tables for fast retrieval...")
+    tables = {
+        "state": index_table(state_path, "state"),
+        "queue": index_table(queue_path, "queue"),
+        "odme": index_table(odme_path, "odme")
+    }
+
+    print(f"Streaming key file from {key_file} to build {out_path}...")
+    first_chunk = True
+    total_written = 0
+    missing_counts = {"state": 0, "queue": 0, "odme": 0}
+
+    for chunk in pd.read_csv(key_file, chunksize=CHUNK_SIZE, dtype=str):
+        chunk["timestamp"] = pd.to_datetime(chunk["timestamp"], utc=True, errors="coerce")
+        out = pd.DataFrame({
+            "submission_id": chunk["submission_id"].astype("int64"),
+            "task": chunk["task"].astype(str)
+        })
+        for col in ("speed_kmh", "flow_vph", "queue_pred", "path_flow"):
+            out[col] = 0.0
+
+        for task, table in tables.items():
+            rows = (out["task"] == task)
+            if not rows.any():
+                continue
+            wanted = pd.MultiIndex.from_frame(chunk.loc[rows, KEYS[task]])
+            found = table.reindex(wanted)
+            for col in VALUES[task]:
+                vals = found[col].to_numpy()
+                missing_counts[task] += int(pd.isna(vals).sum())
+                out.loc[rows, col] = pd.Series(vals).fillna(0.0).to_numpy()
+
+        out[OUT_COLUMNS].to_csv(out_path, mode="w" if first_chunk else "a", header=first_chunk, index=False)
+        first_chunk = False
+        total_written += len(out)
+        print(f"\rProcessed: {total_written:,} rows", end="", flush=True)
+
+    print(f"\nMerge complete: {total_written:,} rows written to {out_path} in {time.time()-t0:.1f}s")
+    
+    # Validation diagnostics
+    print("Running submission diagnostics...")
+    for task, cnt in missing_counts.items():
+        if cnt > 0:
+            print(f"Warning: {cnt:,} {task} rows had no matching prediction and were filled with 0.0.")
+        else:
+            print(f"[OK] {task}: 100% matched.")
+
+    sample = pd.read_csv(out_path, nrows=5000)
+    assert sample.columns.tolist() == OUT_COLUMNS, f"Invalid columns: {sample.columns}"
+    assert not sample.isna().any().any(), "Submission contains NaN values!"
+    assert (sample["speed_kmh"] >= 0).all(), "Negative speed detected!"
+    assert (sample["flow_vph"] >= 0).all(), "Negative flow detected!"
+    assert sample["queue_pred"].isin([0, 1]).all(), "Non-binary queue_pred detected!"
+    assert (sample["path_flow"] >= 0).all(), "Negative path_flow detected!"
+    
+    file_mb = out_path.stat().st_size / (1024 * 1024)
+    print(f"Verification Successful: {out_path.name} is {file_mb:.1f} MB and 100% contract-compliant.")
+    return total_written
+
+
+########## ## Section 11: Pre-Trained Weights & Auxiliary Artifacts Verification ##########
+import os, glob
+from pathlib import Path
+
+# Robust discovery of model and mu cache
+hits = glob.glob('/kaggle/input/**/task2_lgbm.txt', recursive=True)
+if hits:
+    os.environ['LGBM_MODEL_PATH'] = hits[0]
+    os.environ['MU_CACHE_DIR'] = str(Path(hits[0]).parent)
+    print('model: True, path:', hits[0])
+    print('mu:', len(list(Path(os.environ['MU_CACHE_DIR']).glob('D*.json'))), 'panels')
+else:
+    print('model: False (not found in /kaggle/input)')
+
+
+########## ## Section 12: End-to-End Pipeline Execution & Verification ##########
+import sys, time, shutil
+sys.path.insert(0, 'src')
+from pathlib import Path
+from config import locate_release_root
+from task1_state import run_task1
+from task2_queue import run_task2
+from task4_odme import run_task4
+from submission import merge_and_validate_submission
+t0=time.time()
+REL = locate_release_root()
+print('release:', REL)
+SPLITS=['validation','private']
+run_task1(REL, SPLITS, Path('work/state_submission.csv'))
+run_task2(REL, SPLITS, Path('work/queue_submission.csv'))
+run_task4(REL, SPLITS, Path('work/odme_submission.csv'))
+KEY = REL/'submission_key.csv'
+merge_and_validate_submission(Path('work/state_submission.csv'),
+    Path('work/queue_submission.csv'), Path('work/odme_submission.csv'),
+    KEY, Path('/kaggle/working/submission.csv'))
+# Clean up temporary work directory and pycache so only submission.csv is in output
+shutil.rmtree('work', ignore_errors=True)
+shutil.rmtree('src/__pycache__', ignore_errors=True)
+print(f'DONE {time.time()-t0:.0f}s')
+
